@@ -47,7 +47,7 @@ def load_snapshot(fname: str):
 def api_available() -> bool:
     """探活检查（5 分钟缓存），避免 OpenDota 宕机时每页都等超时。"""
     try:
-        req = urllib.request.Request("https://api.opendota.com/api/patches",
+        req = urllib.request.Request("https://api.opendota.com/api/distributions",
                                      headers={"User-Agent": "dota2-analytics-demo/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             return r.status == 200
@@ -184,18 +184,19 @@ def page_overview():
                 '<div class="hero-sub">天梯环境、天梯分分布与版本时间线 — 数据来自 OpenDota 官方公开 API</div>',
                 unsafe_allow_html=True)
 
-    patches, live1 = get_data("patches.json", "/patches")
+    patches = load_snapshot("patches.json")  # 版本历史来自 Dota2 官方 datafeed（OpenDota /patches 已下线）
     dist, live2 = get_data("distributions.json", "/distributions")
     heroes = load_snapshot("heroes_official.json")
     hero_stats, live3 = get_data("heroStats.json", "/heroStats")
 
-    if not live1 or not live2 or not live3:
+    if not live2 or not live3:
         st.info("当前 OpenDota 实时接口暂时不可用，正在展示随应用打包的真实数据快照。")
 
     n_heroes = len(hero_stats) if hero_stats else len(heroes["result"]["data"]["heroes"])
-    kpis = [("当前版本", patches[0]["name"] if patches else "—")]
+    patch_list = patches["patches"] if patches else []
+    current_patch = patch_list[-1]["patch_number"] if patch_list else "—"
+    kpis = [("当前版本", current_patch)]
     if dist and "legacy" in dist:
-        total_mmr = sum(r["cumulative_count"] for r in dist["legacy"]["rows"][:1])
         kpis.append(("天梯玩家样本(最近一次统计)", f"{dist['legacy']['rows'][-1]['cumulative_count']:,}"))
     kpis += [("收录英雄数", f"{n_heroes}"),
              ("快照生成时间", datetime.fromtimestamp(os.path.getmtime(os.path.join(DATA_DIR, 'heroes_official.json'))).strftime("%m-%d %H:%M"))]
@@ -211,7 +212,7 @@ def page_overview():
             fig = go.Figure(go.Bar(x=df["分段"], y=df["人数"], marker_color=ACCENT,
                                    marker_line_width=0))
             fig.update_layout(xaxis_tickangle=-45, title="MMR 分段人数分布（官方匹配池统计）")
-            st.plotly_chart(plotly_layout(fig), use_container_width=True)
+            st.plotly_chart(plotly_layout(fig), width="stretch")
 
     with right:
         st.markdown("##### 🏅 竞技天梯段位分布")
@@ -220,14 +221,14 @@ def page_overview():
             df = pd.DataFrame(rows).head(15)
             fig = go.Figure(go.Bar(y=df["段位"][::-1], x=df["占比"][::-1], orientation="h",
                                    marker_color=GOLD, marker_line_width=0))
-            st.plotly_chart(plotly_layout(fig, height=420), use_container_width=True)
+            st.plotly_chart(plotly_layout(fig, height=420), width="stretch")
 
     st.markdown("##### 🗓️ 版本时间线（近 10 个版本）")
-    if patches:
-        rows = [{"版本": p["name"], "发布日期": datetime.fromtimestamp(p["date"], CST).strftime("%Y-%m-%d"),
-                 "游戏性更新天数": p.get("gameplay_patches", 0) if isinstance(p, dict) else None}
-                for p in patches[:10]]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if patch_list:
+        rows = [{"版本": p["patch_number"],
+                 "发布日期": datetime.fromtimestamp(p["patch_timestamp"], CST).strftime("%Y-%m-%d")}
+                for p in patch_list[-10:]][::-1]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def hero_df_from_stats(hero_stats, heroes_official, bracket):
@@ -309,7 +310,7 @@ def page_hero_meta():
         fig.add_vline(x=mean_x, line_dash="dot", line_color="rgba(255,255,255,0.25)")
         fig.add_hline(y=mean_y, line_dash="dot", line_color="rgba(255,255,255,0.25)")
         fig.update_layout(title=f"{BRACKETS[bracket]}分段 · 选取率 vs 胜率（气泡大小=选取次数）")
-        st.plotly_chart(plotly_layout(fig, height=560), use_container_width=True)
+        st.plotly_chart(plotly_layout(fig, height=560), width="stretch")
 
     with tab2:
         top = view.nlargest(15, "胜率%")
@@ -329,7 +330,7 @@ def page_hero_meta():
         st.dataframe(
             view[["中文名", "英雄", "属性", "复杂度", "胜率%", "选取率%", "选取次数"]]
             .sort_values("胜率%", ascending=False),
-            use_container_width=True, hide_index=True, height=560,
+            width="stretch", hide_index=True, height=560,
             column_config={
                 "中文名": st.column_config.TextColumn("英雄(中文)", width="small"),
                 "英雄": st.column_config.TextColumn("Hero", width="small"),
@@ -368,12 +369,12 @@ def page_pro_matches():
 
     with tab1:
         show = df[["开始时间", "联赛", "天辉", "夜魇", "获胜方", "比分", "时长"]].head(50)
-        st.dataframe(show, use_container_width=True, hide_index=True, height=520)
+        st.dataframe(show, width="stretch", hide_index=True, height=520)
 
     with tab2:
         fig = px.histogram(df, x="duration", nbins=30, color_discrete_sequence=[ACCENT])
         fig.update_layout(title="比赛时长分布（秒）", xaxis_title="时长(秒)", yaxis_title="场次")
-        st.plotly_chart(plotly_layout(fig), use_container_width=True)
+        st.plotly_chart(plotly_layout(fig), width="stretch")
 
     with tab3:
         league = df.groupby("联赛").agg(场次=("match_id", "count"),
@@ -382,7 +383,7 @@ def page_pro_matches():
         fig = go.Figure(go.Bar(y=league["联赛"][::-1], x=league["场次"][::-1], orientation="h",
                                marker_color=GOLD))
         fig.update_layout(title="各联赛比赛场次 TOP 10")
-        st.plotly_chart(plotly_layout(fig), use_container_width=True)
+        st.plotly_chart(plotly_layout(fig), width="stretch")
 
 
 def page_pro_players():
@@ -416,22 +417,23 @@ def page_pro_players():
                 cc = pdf["country_code"].value_counts().head(10)
                 fig = go.Figure(go.Bar(x=cc.index, y=cc.values, marker_color=ACCENT))
                 fig.update_layout(title="选手数量 TOP 10 国家/地区")
-                st.plotly_chart(plotly_layout(fig), use_container_width=True)
+                st.plotly_chart(plotly_layout(fig), width="stretch")
             with c2:
                 teams = pdf["team_name"].dropna().value_counts().head(10)
                 fig = go.Figure(go.Bar(y=teams.index[::-1], x=teams.values[::-1], orientation="h",
                                        marker_color=GOLD))
                 fig.update_layout(title="现役选手数 TOP 10 战队")
-                st.plotly_chart(plotly_layout(fig), use_container_width=True)
+                st.plotly_chart(plotly_layout(fig), width="stretch")
             st.markdown("**选手检索**（输入姓名或战队名）")
             q = st.text_input("搜索", placeholder="如: Ame, Team Liquid, N0tail", label_visibility="collapsed")
-            view = pdf[["name", "team_name", "country_code", "fantasy_role", "steam_id"]]
-            view.columns = ["选手", "战队", "地区", "位置(1-5)", "SteamID"]
+            view = pdf[["name", "personaname", "team_name", "country_code", "fantasy_role", "account_id"]].copy()
+            view.columns = ["职业ID", "选手昵称", "战队", "地区", "位置(1-5)", "AccountID"]
             if q:
                 ql = q.lower()
-                view = view[view["选手"].str.lower().str.contains(ql, na=False) |
+                view = view[view["职业ID"].str.lower().str.contains(ql, na=False) |
+                            view["选手昵称"].str.lower().str.contains(ql, na=False) |
                             view["战队"].str.lower().str.contains(ql, na=False)]
-            st.dataframe(view.head(100), use_container_width=True, hide_index=True, height=420)
+            st.dataframe(view.head(100), width="stretch", hide_index=True, height=420)
 
     with tab2:
         if not hero_list:
