@@ -512,4 +512,10 @@ st.markdown('<div class="hero-title" style="font-size:2.1rem">⚔️ Dota2 比�
             '<div class="hero-sub">基于 OpenDota 官方公开 API 的职业比赛深度分析 Demo</div>',
             unsafe_allow_html=True)
 
-PAGES[page]()
+
+for fn in [page_matches, page_match_detail, page_stats, page_about]:
+    try:
+        fn()
+    except Exception as e:
+        import traceback; traceback.print_exc(); print("PAGEFAIL", fn.__name__)
+

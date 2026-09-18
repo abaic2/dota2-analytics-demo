@@ -1,0 +1,8 @@
+2026-09-18 17:46:36.652 Uvicorn server started on :::8502
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8502
+  Network URL: http://192.168.0.111:8502
+  External URL: http://118.73.133.117:8502
+
