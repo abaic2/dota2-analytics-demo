@@ -1,6 +1,7 @@
 """Dota2 T1 职业比赛数据分析 Demo — 数据来源: OpenDota 官方公开 API（真实数据）
 
-T1 定义: OpenDota 官方联赛分级中的 premium（顶级）联赛，如 TI、利雅得大师赛、ESL One、DreamLeague 等。
+T1 定义: OpenDota premium 分级 + 主流顶级赛事白名单。
+新增: 全局联赛筛选、英雄 BP 深度分析、Elo 对战/比分预测（含回测）。
 """
 import json
 import os
@@ -25,6 +26,7 @@ ACCENT = "#C23C2A"   # Dota2 红
 GOLD = "#C9A227"
 RADIANT = "#5AD35A"  # 天辉绿
 DIRE = "#E54545"     # 夜魇红
+BLUE = "#5AA7E5"
 BG = "#0F1116"
 PANEL = "#1A1D24"
 
@@ -59,7 +61,6 @@ def load_snapshot(fname: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def api_available() -> bool:
-    """探活检查（5 分钟缓存），避免 OpenDota 宕机时每页都等超时。"""
     try:
         req = urllib.request.Request("https://api.opendota.com/api/distributions",
                                      headers={"User-Agent": "dota2-analytics-demo/1.0"})
@@ -84,7 +85,6 @@ def live_fetch(path: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def hero_maps():
-    """hero_id -> (中文名, 图标)。合并官方中文名与 OpenDota constants。"""
     cn = {}
     constants = load_snapshot("constants.json") or {}
     for hid, h in constants.items():
@@ -196,15 +196,19 @@ def fmt_dur(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def load_t1():
-    df = load_snapshot("t1Matches.json")
-    if df is None:
+# ----------------------------------------------------------------------------
+# 数据加载与全局筛选
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def _t1_base():
+    raw = load_snapshot("t1Matches.json")
+    if raw is None:
         return None, False
     leagues = load_snapshot("leagues.json") or []
     tier_map = {l["leagueid"]: l.get("tier") for l in leagues}
     fresh = [m for m in (live_fetch("/proMatches") or [])
              if is_t1(tier_map.get(m.get("leagueid")), m.get("league_name"))]
-    seen, merged = set(m["match_id"] for m in df), list(df)
+    seen, merged = set(m["match_id"] for m in raw), list(raw)
     if fresh:
         for m in fresh:
             if m["match_id"] not in seen:
@@ -228,21 +232,89 @@ def t1_df(matches):
     return df.sort_values("start_time", ascending=False).reset_index(drop=True)
 
 
+def all_leagues():
+    raw, _ = _t1_base()
+    if not raw:
+        return []
+    names = sorted({m.get("league_name") or "—" for m in raw})
+    return [n for n in names if n != "—"]
+
+
+def get_filtered_df():
+    """应用侧边栏联赛筛选后的比赛 DataFrame（所有页面共用）。"""
+    raw, fresh = _t1_base()
+    if not raw:
+        return None, fresh
+    df = t1_df(raw)
+    sel = st.session_state.get("league_filter") or []
+    if sel:
+        df = df[df["联赛"].isin(sel)]
+    return df, fresh
+
+
+def get_filtered_details():
+    details = load_snapshot("t1Details.json") or []
+    sel = st.session_state.get("league_filter") or []
+    if sel:
+        details = [d for d in details if d.get("league_name") in sel]
+    return details
+
+
+# ----------------------------------------------------------------------------
+# Elo 模型（预测模块核心）
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def elo_model(matches_raw):
+    """按时间顺序在 T1 比赛上训练 Elo；同时输出逐场回测结果。
+
+    matches_raw: list[dict]（快照原始结构）
+    """
+    ms = sorted(matches_raw, key=lambda m: m["start_time"])
+    ratings = {}
+    K = 32
+    hist = []
+    for m in ms:
+        r_name = (m.get("radiant_name") or "").strip()
+        d_name = (m.get("dire_name") or "").strip()
+        if not r_name or not d_name or r_name == "TBD" or d_name == "TBD":
+            continue
+        ra = ratings.get(r_name, 1500.0)
+        rd = ratings.get(d_name, 1500.0)
+        ea = 1.0 / (1.0 + 10 ** ((rd - ra) / 400.0))          # 天辉(按队伍强度)期望胜率
+        actual = 1 if m.get("radiant_win") else 0
+        hist.append({"match_id": m["match_id"], "ea": ea, "actual": actual,
+                     "r_name": r_name, "d_name": d_name})
+        ratings[r_name] = ra + K * (actual - ea)
+        ratings[d_name] = rd + K * ((1 - actual) - (1 - ea))
+    acc = sum(1 for h in hist if round(h["ea"]) == h["actual"]) / max(len(hist), 1)
+    logloss = -sum(h["actual"] * max(h["ea"], 1e-9) + (1 - h["actual"]) * max(1 - h["ea"], 1e-9)
+                   for h in hist) / max(len(hist), 1)
+    return ratings, acc, logloss, len(hist)
+
+
+def series_prob(p: float, bo: int) -> float:
+    """单图胜率 p → 系列赛胜率（先到 N 局）。"""
+    if bo == 1:
+        return p
+    n = (bo + 1) // 2  # 需要赢的局数
+    from math import comb
+    return sum(comb(n + k - 1, k) * (p ** n) * ((1 - p) ** k) for k in range(n))
+
+
 # ----------------------------------------------------------------------------
 # 页面 1：比赛库
 # ----------------------------------------------------------------------------
 def page_matches():
     st.markdown('<div class="hero-title">T1 比赛库</div>'
-                '<div class="hero-sub">主流顶级赛事：TI · 利雅得大师赛 · ESL One · 电竞世界杯 · BLAST Slam · DreamLeague 等 — premium 分级 + 顶级赛事白名单</div>',
+                '<div class="hero-sub">可用左侧栏筛选联赛；此处再按战队/阵营/时长细分 — OpenDota 真实数据</div>',
                 unsafe_allow_html=True)
 
-    matches, fresh = load_t1()
-    if not matches:
+    df, fresh = get_filtered_df()
+    if df is None:
         st.error("比赛数据不可用。")
         return
     if not fresh:
         st.info("当前展示打包快照数据（OpenDota 实时接口暂不可用）。")
-    df = t1_df(matches)
 
     kpi_row([("T1 对局数", f"{len(df)}"),
              ("覆盖联赛", f"{df['联赛'].nunique()}"),
@@ -255,14 +327,11 @@ def page_matches():
     side = c2.radio("阵营筛选", ["全部", "天辉获胜", "夜魇获胜"], horizontal=True)
     dur = c3.slider("时长下限（分钟）", 15, 90, 20, 5)
 
-    lg = c1.multiselect("限定联赛", sorted(df["联赛"].unique()))
     view = df[df["duration"] >= dur * 60]
     if q:
         ql = q.lower()
         view = view[view.apply(lambda r: ql in str(r["天辉"]).lower() or ql in str(r["夜魇"]).lower()
                                          or ql in str(r["联赛"]).lower(), axis=1)]
-    if lg:
-        view = view[view["联赛"].isin(lg)]
     if side == "天辉获胜":
         view = view[view["radiant_win"]]
     elif side == "夜魇获胜":
@@ -291,8 +360,9 @@ def pb_badge(item, maps):
 def render_match_detail(m, maps, league_label="—"):
     r_win = m.get("radiant_win")
     r_score, d_score = m.get("radiant_score", 0), m.get("dire_score", 0)
-    r_name = (m.get("radiant_team") or {}).get("name") or m.get("radiant_team") or "天辉"
-    d_name = (m.get("dire_team") or {}).get("name") or m.get("dire_team") or "夜魇"
+    r_name = (m.get("radiant_team") or {}).get("name") if isinstance(m.get("radiant_team"), dict) else m.get("radiant_team")
+    d_name = (m.get("dire_team") or {}).get("name") if isinstance(m.get("dire_team"), dict) else m.get("dire_team")
+    r_name, d_name = r_name or "天辉", d_name or "夜魇"
     winner = "🟢 天辉" if r_win else "🔴 夜魇"
     st.markdown(f"""
 <div class="panel">
@@ -315,7 +385,7 @@ def render_match_detail(m, maps, league_label="—"):
                 "阵营": side, "英雄": cn, "头像": icon,
                 "选手": p.get("name") or "匿名",
                 "K/D/A": f'{p.get("kills",0)}/{p.get("deaths",0)}/{p.get("assists",0)}',
-                "KDA值": round((p.get("kills",0)+p.get("assists",0))/max(p.get("deaths",0) or 1, 1), 2),
+                "KDA": round(((p.get("kills",0) or 0) + (p.get("assists",0) or 0)) / max(p.get("deaths",1) or 1, 1), 2),
                 "等级": p.get("level", 0),
                 "GPM": p.get("gold_per_min", 0), "XPM": p.get("xp_per_min", 0),
                 "正补": p.get("last_hits", 0), "反补": p.get("denies", 0),
@@ -330,30 +400,27 @@ def render_match_detail(m, maps, league_label="—"):
             for _, r in sub.iterrows():
                 trs += (f'<tr><td><img src="{r["头像"]}" style="height:36px;border-radius:6px;vertical-align:middle;margin-right:8px">{r["英雄"]}</td>'
                         f'<td>{r["选手"]}</td><td style="font-weight:700;color:{color}">{r["K/D/A"]}</td>'
-                        f'<td>{r["KDA值"]}</td><td>{r["GPM"]}</td><td>{r["XPM"]}</td>'
+                        f'<td>{r["KDA"]}</td><td>{r["GPM"]}</td><td>{r["XPM"]}</td>'
                         f'<td>{r["正补"]}/{r["反补"]}</td><td>{r["净资产"]:,}</td>'
                         f'<td>{r["英雄伤害"]:,}</td><td>{r["推塔伤害"]:,}</td><td>{r["治疗"]:,}</td></tr>')
             st.markdown(f'<div class="panel"><b style="color:{color};font-size:1.05rem">{side_name}方</b>'
                         f'<table class="data-table"><tr><th>英雄</th><th>选手</th><th>K/D/A</th><th>KDA</th>'
                         f'<th>GPM</th><th>XPM</th><th>正/反补</th><th>净资产</th><th>英雄伤害</th><th>推塔伤害</th><th>治疗</th></tr>'
                         f'{trs}</table></div>', unsafe_allow_html=True)
-        st.caption("💡 表内数字为 OpenDota 解析的官方重放数据。")
 
     with tabs[1]:
         if pb:
+            picks = sorted([p for p in pb if p["is_pick"]], key=lambda x: x["order"])
+            bans = sorted([p for p in pb if not p["is_pick"]], key=lambda x: x["order"])
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**🧩 Pick（按顺序）**")
-                st.markdown("".join(pb_badge(x, maps) for x in sorted([p for p in pb if p["is_pick"]],
-                                                                       key=lambda x: x["order"])),
-                            unsafe_allow_html=True)
+                st.markdown("".join(pb_badge(x, maps) for x in picks), unsafe_allow_html=True)
             with c2:
                 st.markdown("**🚫 Ban（按顺序）**")
-                st.markdown("".join(pb_badge(x, maps) for x in sorted([p for p in pb if not p["is_pick"]],
-                                                                       key=lambda x: x["order"])),
-                            unsafe_allow_html=True)
+                st.markdown("".join(pb_badge(x, maps) for x in bans), unsafe_allow_html=True)
         else:
-            st.caption("该场比赛暂无 BP 数据（OpenDota 尚未解析），可先看选手数据与曲线。")
+            st.caption("该场比赛暂无 BP 数据（OpenDota 尚未解析）。")
 
     with tabs[2]:
         ga, xa = m.get("radiant_gold_adv"), m.get("radiant_xp_adv")
@@ -361,14 +428,13 @@ def render_match_detail(m, maps, league_label="—"):
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=ga, mode="lines", name="天辉经济领先", line=dict(color=GOLD, width=2.5)))
             if xa:
-                fig.add_trace(go.Scatter(y=xa, mode="lines", name="天辉经验领先", line=dict(color="#5AA7E5", width=2)))
+                fig.add_trace(go.Scatter(y=xa, mode="lines", name="天辉经验领先", line=dict(color=BLUE, width=2)))
             fig.add_hline(y=0, line_color="rgba(255,255,255,0.3)")
             fig.update_layout(title="天辉视角 经济/经验领先曲线（正=天辉领先）",
                               xaxis_title="比赛分钟", yaxis_title="领先值")
             st.plotly_chart(plotly_layout(fig, height=440), width="stretch")
             flips = sum(1 for a, b in zip(ga, ga[1:]) if (a >= 0) != (b >= 0))
-            lead = max(ga)
-            trail = min(ga)
+            lead, trail = max(ga), min(ga)
             kpi_row([("经济优势反转次数", f"{flips}"),
                      ("天辉最大领先", f"{lead:,.0f}"),
                      ("夜魇最大领先", f"{-trail:,.0f}" if trail < 0 else "0"),
@@ -404,14 +470,13 @@ def render_match_detail(m, maps, league_label="—"):
 
 def page_match_detail():
     st.markdown('<div class="hero-title">深度复盘</div>'
-                '<div class="hero-sub">T1 比赛单场全解析：BP · 选手数据 · 经济曲线 · 目标物 — 优先实时接口，内置快照兜底</div>',
+                '<div class="hero-sub">T1 比赛单场全解析（跟随左侧联赛筛选）— 优先实时接口，快照兜底</div>',
                 unsafe_allow_html=True)
 
-    matches, _ = load_t1()
-    if not matches:
-        st.error("比赛列表不可用。")
+    df, _ = get_filtered_df()
+    if df is None or not len(df):
+        st.error("比赛列表不可用（或当前联赛筛选为空）。")
         return
-    df = t1_df(matches)
     maps = hero_maps()
 
     def label(r):
@@ -424,13 +489,13 @@ def page_match_detail():
     m = live_fetch(f"/matches/{match_id}")
     src = "OpenDota 实时接口"
     if not m:
-        slim = [x for x in (load_snapshot("t1Details.json") or []) if x.get("match_id") == match_id]
+        slim = [x for x in get_filtered_details() if x.get("match_id") == match_id]
         if slim:
             m, src = slim[0], "内置快照"
     if not m:
         st.warning("详情暂时不可用（实时接口故障且该场不在快照中）。")
         return
-    st.caption(f"数据来源：{src}" + (" · 部分图表在快照模式下不可用" if src == "内置快照" else ""))
+    st.caption(f"数据来源：{src}")
     render_match_detail(m, maps, row["联赛"])
 
 
@@ -438,54 +503,93 @@ def page_match_detail():
 # 页面 3：英雄风向
 # ----------------------------------------------------------------------------
 def page_heroes():
-    st.markdown('<div class="hero-title">英雄风向</div>'
-                '<div class="hero-sub">T1 赛场的英雄 BP 与表现统计 — 基于最近 60 场 T1 比赛的解析数据</div>',
+    st.markdown('<div class="hero-title">英雄选择与 BP 分析</div>'
+                '<div class="hero-sub">T1 赛场英雄出场/禁用/胜率/组合搭配 — 基于最近 60 场解析数据（跟随联赛筛选）</div>',
                 unsafe_allow_html=True)
 
-    details = load_snapshot("t1Details.json") or []
+    details = get_filtered_details()
     if not details:
-        st.error("详情快照不可用。")
+        st.error("详情快照不可用（或当前联赛筛选为空）。")
         return
     maps = hero_maps()
 
-    # 聚合英雄出场/胜场/禁用
-    pick, win, ban = {}, {}, {}
+    # ---- 聚合 ----
+    pick, win, ban, side_win = {}, {}, {}, {"radiant": {}, "dire": {}}
+    firstpick, lastpick = {}, {}   # 一选/末选英雄
+    duo = {}                        # 同队组合
     n_bp = 0
     for m in details:
+        pb = m.get("picks_bans") or []
+        if pb:
+            n_bp += 1
+            picks = sorted([x for x in pb if x["is_pick"]], key=lambda x: x["order"])
+            if picks:
+                firstpick[picks[0]["hero_id"]] = firstpick.get(picks[0]["hero_id"], 0) + 1
+                lastpick[picks[-1]["hero_id"]] = lastpick.get(picks[-1]["hero_id"], 0) + 1
+            for x in pb:
+                if not x["is_pick"]:
+                    ban[x["hero_id"]] = ban.get(x["hero_id"], 0) + 1
+        # 出场与胜率
+        sides = {}
         for p in m.get("players") or []:
             hid = p.get("hero_id")
             pick[hid] = pick.get(hid, 0) + 1
-            won = (p.get("player_slot", 0) < 100) == m.get("radiant_win")
+            is_rad = p.get("player_slot", 0) < 100
+            won = is_rad == m.get("radiant_win")
             if won:
                 win[hid] = win.get(hid, 0) + 1
-        if m.get("picks_bans"):
-            n_bp += 1
-            for x in m["picks_bans"]:
-                if not x["is_pick"]:
-                    ban[x["hero_id"]] = ban.get(x["hero_id"], 0) + 1
+            key = "radiant" if is_rad else "dire"
+            side_win[key].setdefault(hid, [0, 0])[1] += 1
+            side_win[key][hid][0] += 1 if won else 0
+            sides.setdefault(key, []).append(hid)
+        for hid in sides.get("radiant", []):
+            for hid2 in sides.get("radiant", []):
+                if hid < hid2:
+                    duo[(hid, hid2)] = duo.get((hid, hid2), [0, 0])
+                    duo[(hid, hid2)][1] += 1
+                    if m.get("radiant_win"):
+                        duo[(hid, hid2)][0] += 1
+        for hid in sides.get("dire", []):
+            for hid2 in sides.get("dire", []):
+                if hid < hid2:
+                    duo[(hid, hid2)] = duo.get((hid, hid2), [0, 0])
+                    duo[(hid, hid2)][1] += 1
+                    if not m.get("radiant_win"):
+                        duo[(hid, hid2)][0] += 1
 
     rows = []
     for hid, cnt in pick.items():
         cn, icon = hero_cn(hid, maps)
+        rw = side_win["radiant"].get(hid, [0, 0])
+        dw = side_win["dire"].get(hid, [0, 0])
         rows.append({"英雄": cn, "图标": icon, "出场": cnt,
+                     "胜场": win.get(hid, 0),
                      "胜率%": round(win.get(hid, 0) / cnt * 100, 1),
-                     "被禁": ban.get(hid, 0)})
+                     "被禁": ban.get(hid, 0),
+                     "BP率%": round((cnt + ban.get(hid, 0)) / max(n_bp, 1) * 100, 1) if n_bp else 0,
+                     "天辉胜率%": round(rw[0] / rw[1] * 100, 1) if rw[1] else None,
+                     "夜魇胜率%": round(dw[0] / dw[1] * 100, 1) if dw[1] else None,
+                     "一选次数": firstpick.get(hid, 0),
+                     "末选次数": lastpick.get(hid, 0)})
     hdf = pd.DataFrame(rows)
 
     kpi_row([("解析比赛场次", f"{len(details)}"),
              ("含 BP 数据", f"{n_bp}"),
              ("登场英雄数", f"{len(hdf)}"),
-             ("登场英雄占比", f"{len(hdf)/127*100:.0f}%")])
-    st.caption("注：BP 数据仅 OpenDota 已解析的比赛才有，样本量小于比赛总数。")
+             ("BP 率 100% 英雄", f"{(hdf['BP率%']>=100).sum() if n_bp else 0}")])
+    if not n_bp:
+        st.caption("当前筛选样本中没有 BP 数据。")
 
-    tab1, tab2, tab3 = st.tabs(["🔥 出场热度", "✅ 胜率榜", "🏅 选手高光"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 出场与禁用", "✅ 胜率榜", "🧠 BP 策略", "🤝 英雄组合", "🏅 选手高光"])
 
     with tab1:
         top = hdf.nlargest(15, "出场")
-        fig = go.Figure(go.Bar(y=top["英雄"][::-1], x=top["出场"][::-1], orientation="h",
-                               marker_color=ACCENT, text=top["胜率%"][::-1],
-                               texttemplate="%{x} 场 · 胜率 %{text}%", textposition="outside"))
-        fig.update_layout(title="英雄出场次数 TOP 15", height=520)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=top["英雄"][::-1], x=top["出场"][::-1], orientation="h",
+                             name="出场", marker_color=ACCENT))
+        fig.add_trace(go.Bar(y=top["英雄"][::-1], x=top["被禁"][::-1], orientation="h",
+                             name="被禁", marker_color="#3A4152"))
+        fig.update_layout(barmode="overlay", title="英雄出场 vs 被禁 TOP 15", height=520)
         st.plotly_chart(plotly_layout(fig, height=520), width="stretch")
 
     with tab2:
@@ -496,22 +600,68 @@ def page_heroes():
             trs += (f'<tr><td>{i}</td>'
                     f'<td><img src="{r["图标"]}" style="height:36px;border-radius:6px;vertical-align:middle;margin-right:8px">{r["英雄"]}</td>'
                     f'<td>{r["出场"]}</td><td>{r["被禁"]}</td>'
-                    f'<td style="color:{GOLD};font-weight:700">{r["胜率%"]}%</td></tr>')
+                    f'<td style="color:{GOLD};font-weight:700">{r["胜率%"]}%</td>'
+                    f'<td>{r["天辉胜率%"] if r["天辉胜率%"] is not None else "—"}</td>'
+                    f'<td>{r["夜魇胜率%"] if r["夜魇胜率%"] is not None else "—"}</td></tr>')
         st.markdown(f'<div class="panel"><table class="data-table">'
-                    f'<tr><th>#</th><th>英雄</th><th>出场</th><th>被禁</th><th>胜率</th></tr>{trs}</table></div>',
-                    unsafe_allow_html=True)
+                    f'<tr><th>#</th><th>英雄</th><th>出场</th><th>被禁</th><th>总胜率</th><th>天辉胜率</th><th>夜魇胜率</th></tr>'
+                    f'{trs}</table></div>', unsafe_allow_html=True)
 
     with tab3:
+        st.markdown("**一选 / 末选（BP 顺位信号）**：一选通常是版本最稳核心，末选多为针对性 counter 位")
+        c1, c2 = st.columns(2)
+        with c1:
+            fp = sorted(firstpick.items(), key=lambda kv: -kv[1])[:10]
+            trs = "".join(f'<tr><td>{i}</td><td>{hero_cn(h, maps)[0]}</td><td>{v}</td></tr>'
+                          for i, (h, v) in enumerate(fp, 1))
+            st.markdown(f'<div class="panel"><b>🎯 常被一选</b><table class="data-table">'
+                        f'<tr><th>#</th><th>英雄</th><th>一选次数</th></tr>{trs}</table></div>',
+                        unsafe_allow_html=True)
+        with c2:
+            lp = sorted(lastpick.items(), key=lambda kv: -kv[1])[:10]
+            trs = "".join(f'<tr><td>{i}</td><td>{hero_cn(h, maps)[0]}</td><td>{v}</td></tr>'
+                          for i, (h, v) in enumerate(lp, 1))
+            st.markdown(f'<div class="panel"><b>🔍 常被留到末选</b><table class="data-table">'
+                        f'<tr><th>#</th><th>英雄</th><th>末选次数</th></tr>{trs}</table></div>',
+                        unsafe_allow_html=True)
+        most_banned = hdf.nlargest(10, "被禁")[["英雄", "被禁", "BP率%"]]
+        if n_bp:
+            fig = go.Figure(go.Bar(y=most_banned["英雄"][::-1], x=most_banned["被禁"][::-1],
+                                   orientation="h", marker_color=DIRE))
+            fig.update_layout(title="禁用次数 TOP 10", height=420)
+            st.plotly_chart(plotly_layout(fig, height=420), width="stretch")
+
+    with tab4:
+        st.markdown("**英雄组合（同队双人组）**：至少同队出现 3 次的组合，按胜率排序")
+        duos = [{"英雄A": hero_cn(a, maps)[0], "图标A": hero_cn(a, maps)[1],
+                 "英雄B": hero_cn(b, maps)[0], "图标B": hero_cn(b, maps)[1],
+                 "同队次数": v[1], "胜场": v[0],
+                 "胜率%": round(v[0] / v[1] * 100, 1)}
+                for (a, b), v in duo.items() if v[1] >= 3]
+        if duos:
+            ddf = pd.DataFrame(duos).nlargest(15, "同队次数")
+            trs = ""
+            for i, (_, r) in enumerate(ddf.iterrows(), 1):
+                trs += (f'<tr><td>{i}</td>'
+                        f'<td><img src="{r["图标A"]}" style="height:30px;border-radius:6px;vertical-align:middle;margin-right:6px">{r["英雄A"]}'
+                        f' + <img src="{r["图标B"]}" style="height:30px;border-radius:6px;vertical-align:middle;margin:0 6px 0 6px">{r["英雄B"]}</td>'
+                        f'<td>{r["同队次数"]}</td><td>{r["胜场"]}</td>'
+                        f'<td style="color:{GOLD};font-weight:700">{r["胜率%"]}%</td></tr>')
+            st.markdown(f'<div class="panel"><table class="data-table">'
+                        f'<tr><th>#</th><th>组合</th><th>同队次数</th><th>胜场</th><th>胜率</th></tr>{trs}</table></div>',
+                        unsafe_allow_html=True)
+        else:
+            st.caption("当前样本不足（需要更多含 BP 的解析场次）。")
+
+    with tab5:
         perf = []
         for m in details:
             dur_min = max(m.get("duration", 1) / 60, 1)
             for p in m.get("players") or []:
                 perf.append({
                     "选手": p.get("name") or "匿名",
-                    "hero_id": p.get("hero_id"),
                     "英雄": hero_cn(p.get("hero_id", 0), maps)[0],
                     "GPM": p.get("gold_per_min", 0) or 0,
-                    "KDA": round(((p.get("kills", 0) or 0) + (p.get("assists", 0) or 0)) / max(p.get("deaths", 1) or 1, 1), 2),
                     "正补/分钟": round((p.get("last_hits", 0) or 0) / dur_min, 1),
                     "英雄伤害": p.get("hero_damage", 0) or 0,
                     "match_id": m.get("match_id"),
@@ -520,7 +670,7 @@ def page_heroes():
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**💨 GPM 最高单场 TOP 10**")
-            g = pdf.nlargest(10, "GPM")[["选手", "英雄", "GPM", "match_id"]]
+            g = pdf.nlargest(10, "GPM")
             trs = "".join(f'<tr><td>{i}</td><td>{r["选手"]}</td><td>{r["英雄"]}</td>'
                           f'<td style="color:{GOLD};font-weight:700">{r["GPM"]}</td><td>{r["match_id"]}</td></tr>'
                           for i, (_, r) in enumerate(g.iterrows(), 1))
@@ -528,7 +678,7 @@ def page_heroes():
                         unsafe_allow_html=True)
         with c2:
             st.markdown("**⚔️ 英雄伤害最高单场 TOP 10**")
-            g = pdf.nlargest(10, "英雄伤害")[["选手", "英雄", "英雄伤害", "match_id"]]
+            g = pdf.nlargest(10, "英雄伤害")
             trs = "".join(f'<tr><td>{i}</td><td>{r["选手"]}</td><td>{r["英雄"]}</td>'
                           f'<td style="color:{ACCENT};font-weight:700">{r["英雄伤害"]:,}</td><td>{r["match_id"]}</td></tr>'
                           for i, (_, r) in enumerate(g.iterrows(), 1))
@@ -552,16 +702,13 @@ def team_table(df, min_games=3):
 
 def page_teams():
     st.markdown('<div class="hero-title">战队与联赛</div>'
-                '<div class="hero-sub">T1 赛场战队战绩、近期状态与联赛对比 — 全量聚合分析</div>',
+                '<div class="hero-sub">T1 赛场战队战绩、近期状态与联赛对比（跟随左侧联赛筛选）</div>',
                 unsafe_allow_html=True)
 
-    matches, fresh = load_t1()
-    if not matches:
-        st.error("数据不可用。")
+    df, fresh = get_filtered_df()
+    if df is None or not len(df):
+        st.error("数据不可用（或当前联赛筛选为空）。")
         return
-    if not fresh:
-        st.info("当前展示打包快照数据（OpenDota 实时接口暂不可用）。")
-    df = t1_df(matches)
     teams = team_table(df)
 
     tab1, tab2, tab3, tab4 = st.tabs(["🏆 战队战绩", "📊 近期状态", "🏛️ 联赛对比", "⚔️ 头对头"])
@@ -587,11 +734,11 @@ def page_teams():
                         unsafe_allow_html=True)
 
     with tab2:
-        st.markdown("**近期状态**：统计每支战队最近 10 场 T1 比赛的胜负（左侧旧→右侧新）")
+        st.markdown("**近期状态**：统计每支战队最近 10 场 T1 比赛的胜负（左旧→右新）")
         options = sorted(teams.nlargest(12, "场次")["战队"])
         candidates = list(teams[teams["场次"] >= 5].nlargest(8, "胜率%")["战队"])
         default = [t for t in candidates if t in options][:8]
-        sel = st.multiselect("选择战队（默认胜率榜前 8）", options, default=default)
+        sel = st.multiselect("选择战队", options, default=default)
         lines = []
         for t in sel:
             sub = df[(df["天辉"] == t) | (df["夜魇"] == t)].head(10)
@@ -616,7 +763,6 @@ def page_teams():
         lg = lg.drop(columns=["平均时长秒", "平均击杀"]).nlargest(12, "场次")
         st.dataframe(lg[["联赛", "场次", "场均时长", "天辉胜率", "场均击杀(单方)"]],
                      width="stretch", hide_index=True, height=420)
-        st.caption("时长/胜率差异能反映各联赛的版本环境与赛制强度。")
 
     with tab4:
         st.markdown("**强队头对头**：出场最多的 12 支战队之间的交手记录")
@@ -631,12 +777,135 @@ def page_teams():
             for a in matrix.index:
                 for b in matrix.columns:
                     if pd.notna(matrix.loc[a, b]) and a != b:
-                        w = int(wins.loc[a, b])
-                        h2h.loc[a, b] = f"{w}胜/{matrix.loc[a,b]:.0f}场"
+                        h2h.loc[a, b] = f"{int(wins.loc[a, b])}胜/{matrix.loc[a, b]:.0f}场"
             st.dataframe(h2h, width="stretch", height=460)
             st.caption("行=天辉方，列=夜魇方；单元格显示该对阵中天辉方的胜场/总场次。")
         else:
-            st.caption("样本中没有 12 强之间的交手。")
+            st.caption("当前筛选样本中没有 12 强之间的交手。")
+
+
+# ----------------------------------------------------------------------------
+# 页面 5：对战预测
+# ----------------------------------------------------------------------------
+def page_predict():
+    st.markdown('<div class="hero-title">对战预测</div>'
+                '<div class="hero-sub">基于 Elo 实力评分的胜负与比分预测 — 模型在当前筛选的 T1 比赛上训练并回测</div>',
+                unsafe_allow_html=True)
+
+    raw, fresh = _t1_base()
+    if not raw:
+        st.error("数据不可用。")
+        return
+    ratings, acc, logloss, n_eval = elo_model(tuple(sorted(raw, key=lambda m: m["start_time"])))
+    df, _ = get_filtered_df()
+    if df is None or not len(df):
+        st.error("筛选后数据为空。")
+        return
+
+    kpi_row([("训练对局数", f"{n_eval}"),
+             ("回测准确率", f"{acc*100:.1f}%"),
+             ("回测 LogLoss", f"{logloss:.3f}"),
+             ("覆盖战队", f"{len(ratings)}")])
+    st.caption("模型：Elo（K=32，初始 1500），按时间顺序在筛选后的 T1 比赛上训练；回测为逐场留出预测。准确率显著高于 50% 即说明评分有效。")
+
+    teams = sorted({t for t in ratings if t})
+    c1, c2, c3 = st.columns([2, 2, 1])
+    radiant_team = c1.selectbox("🟢 天辉方", teams,
+                                index=teams.index("PARIVISION") if "PARIVISION" in teams else 0)
+    dire_team = c2.selectbox("🔴 夜魇方", teams,
+                             index=teams.index("Team Liquid") if "Team Liquid" in teams else min(1, len(teams) - 1))
+    bo = c3.radio("赛制", ["BO1", "BO3", "BO5"], index=1)
+
+    if radiant_team == dire_team:
+        st.warning("请选择两支不同的战队。")
+        return
+
+    ra = ratings.get(radiant_team, 1500.0)
+    rd_ = ratings.get(dire_team, 1500.0)
+    p_rad = 1.0 / (1.0 + 10 ** ((rd_ - ra) / 400.0))       # 天辉方单图胜率
+    p_series = series_prob(p_rad, int(bo[2:]))
+
+    # 比分预测：基于两队近期场均得分 + Elo 差修正
+    rad_games = df[(df["天辉"] == radiant_team)]
+    dire_games = df[(df["夜魇"] == dire_team)]
+    league_avg_r = df["radiant_score"].mean()
+    league_avg_d = df["dire_score"].mean()
+    rad_for = rad_games["radiant_score"].mean() if len(rad_games) else league_avg_r
+    dire_against = dire_games["dire_score"].mean() if len(dire_games) else league_avg_d
+    base_r = (rad_for + dire_against) / 2 if pd.notna(rad_for) and pd.notna(dire_against) else (league_avg_r + league_avg_d) / 2
+    base_d = league_avg_d + (league_avg_r - base_r)  # 保持总和一致
+    elo_shift = (p_rad - 0.5) * 8   # 每 0.5 Elo 期望差约 ±4 杀
+    pred_r = max(3, round(base_r + elo_shift))
+    pred_d = max(3, round(base_d - elo_shift))
+
+    # 两队近期状态
+    def recent_form(t):
+        sub = df[(df["天辉"] == t) | (df["夜魇"] == t)].head(10)
+        w = sum(1 for _, r in sub.iterrows() if r["获胜方"] == t)
+        return w, len(sub)
+
+    w1, n1 = recent_form(radiant_team)
+    w2, n2 = recent_form(dire_team)
+    h2h = df[((df["天辉"] == radiant_team) & (df["夜魇"] == dire_team)) |
+             ((df["天辉"] == dire_team) & (df["夜魇"] == radiant_team))]
+
+    st.markdown("---")
+    st.markdown("### 📊 预测结果")
+
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        fig = go.Figure(go.Bar(x=[p_rad * 100, (1 - p_rad) * 100], y=["天辉 " + radiant_team, "夜魇 " + dire_team],
+                               orientation="h", marker_color=[RADIANT, DIRE],
+                               text=[f"{p_rad*100:.1f}%", f"{(1-p_rad)*100:.1f}%"], textposition="auto"))
+        fig.update_layout(title=f"单图胜率预测", height=260)
+        st.plotly_chart(plotly_layout(fig, height=260), width="stretch")
+    with c2:
+        color = RADIANT if p_series >= 0.5 else DIRE
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number", value=p_series * 100, number={"suffix": "%"},
+            title={"text": f"{radiant_team} 系列赛获胜概率 ({bo})"},
+            gauge={"axis": {"range": [0, 100]}, "bar": {"color": color},
+                   "bgcolor": "rgba(0,0,0,0)",
+                   "steps": [{"range": [0, 50], "color": "rgba(229,69,69,0.18)"},
+                             {"range": [50, 100], "color": "rgba(90,211,90,0.18)"}]}))
+        fig.update_layout(paper_bgcolor=PANEL, font_color="#E8E6E3", height=260,
+                          margin=dict(l=40, r=40, t=60, b=20))
+        st.plotly_chart(fig, width="stretch")
+    with c3:
+        st.markdown(f"""
+<div class="panel" style="height:100%">
+<div style="color:#9AA3B2;font-size:.85rem">预测比分（总击杀）</div>
+<div style="font-family:'Noto Serif SC',serif;font-size:2rem;font-weight:800">
+<span style="color:{RADIANT}">{pred_r}</span>
+<span style="color:#9AA3B2;font-size:1rem"> : </span>
+<span style="color:{DIRE}">{pred_d}</span></div>
+<div style="color:#9AA3B2;font-size:.85rem;margin-top:8px">
+{radiant_team}: 近{n1}场 {w1}胜<br>{dire_team}: 近{n2}场 {w2}胜<br>
+历史交手: {len(h2h)} 场（{radiant_team} 胜 {sum(1 for _, r in h2h.iterrows() if r["获胜方"] == radiant_team)} 场）</div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("### 🔍 依据")
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        diff = ra - rd_
+        st.markdown(f"""<div class="panel"><b>Elo 评分</b><br>
+<span style="color:{RADIANT}">{radiant_team}: {ra:.0f}</span><br>
+<span style="color:{DIRE}">{dire_team}: {rd_:.0f}</span><br>
+<span style="color:#9AA3B2">分差 {diff:+.0f} → 单图期望 {p_rad*100:.1f}%</span></div>""", unsafe_allow_html=True)
+    with cc2:
+        p3 = series_prob(p_rad, 3)
+        p5 = series_prob(p_rad, 5)
+        st.markdown(f"""<div class="panel"><b>不同赛制胜率</b><br>
+BO1: {p_rad*100:.1f}%<br>BO3: {p3*100:.1f}%<br>BO5: {p5*100:.1f}%<br>
+<span style="color:#9AA3B2">强队在长系列赛更占优</span></div>""", unsafe_allow_html=True)
+    with cc3:
+        exp_dur = df["duration"].mean()
+        st.markdown(f"""<div class="panel"><b>预期比赛形态</b><br>
+预计时长: {fmt_dur(exp_dur)}（样本均值）<br>
+天辉场均击杀: {league_avg_r:.0f} / 夜魇场均击杀: {league_avg_d:.0f}<br>
+<span style="color:#9AA3B2">Elo 差带来的击杀修正 {elo_shift:+.1f}</span></div>""", unsafe_allow_html=True)
+
+    st.caption("⚠️ 本预测为统计模型演示（基于历史 T1 比赛的 Elo 回测），不构成任何投注建议。Dota2 比赛结果受版本、状态、BP 等诸多因素影响，仅供参考娱乐。")
 
 
 def page_about():
@@ -648,18 +917,24 @@ def page_about():
 <ul>
 <li><b>OpenDota 官方公开 API</b>（<code>api.opendota.com</code>）</li>
 <li><b>T1 联赛定义</b>：OpenDota 官方分级 <code>tier = premium</code>（TI 等最高级赛事）+ 主流顶级赛事白名单（电竞世界杯、BLAST Slam、利雅得大师赛、ESL One、DreamLeague、TI 区域预选赛等），过滤掉低级别刷分局</li>
-<li>比赛列表：翻页抓取约 800 场近期 T1 对局（<code>/proMatches</code> 分页）</li>
+<li>比赛列表：翻页抓取约 600 场近期 T1 对局（<code>/proMatches</code> 分页）</li>
 <li>英雄风向：最近 60 场 T1 比赛的完整解析数据（<code>/matches/&#123;id&#125;</code>，含 BP、选手数据、经济曲线）</li>
 <li>英雄官方中文译名：Dota2 官方 datafeed；头图：Steam 官方 CDN</li>
 </ul>
+<h4>🔮 预测模型说明</h4>
+<ul>
+<li><b>Elo 评分</b>：K=32、初始 1500，按时间顺序在 T1 比赛上训练；每场比赛后更新双方评分</li>
+<li><b>胜负预测</b>：标准 Elo 期望公式，BO3/BO5 用二项展开换算系列赛胜率</li>
+<li><b>比分预测</b>：双方近期场均击杀 + Elo 差修正（±8 杀区间内）</li>
+<li><b>回测</b>：逐场留出预测（先预测再更新评分），页面展示真实准确率与 LogLoss</li>
+</ul>
 <h4>🔄 数据更新机制</h4>
 <ul>
-<li>比赛库/战队联赛：内置真实快照 + 运行时自动合并最新一页实时数据</li>
+<li>比赛库/战队/预测：内置真实快照 + 运行时自动合并最新一页实时数据</li>
 <li>深度复盘：优先实时查询详情接口（1 小时缓存），快照兜底</li>
-<li>英雄风向：基于打包的 60 场解析快照，保证加载速度</li>
 </ul>
 <h4>⚠️ 声明</h4>
-<p>本站为数据分析演示 Demo，与 Valve、OpenDota 无关联；数据仅作演示用途。</p>
+<p>本站为数据分析演示 Demo，与 Valve、OpenDota 无关联；预测仅为统计模型演示，不构成投注建议。</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -671,11 +946,11 @@ inject_css()
 
 with st.sidebar:
     st.markdown("## ⚔️ Dota2 T1 数据站")
-    st.caption("OpenDota premium 联赛 · Streamlit Demo")
+    st.caption("OpenDota 真实数据 · Streamlit Demo")
     page = option_menu(
         menu_title=None,
-        options=["T1 比赛库", "深度复盘", "英雄风向", "战队与联赛", "关于"],
-        icons=["list-stars", "magnifying-glass-chart", "fire", "trophy", "info-circle"],
+        options=["T1 比赛库", "深度复盘", "英雄风向", "战队与联赛", "对战预测", "关于"],
+        icons=["list-stars", "magnifying-glass-chart", "fire", "trophy", "cpu", "info-circle"],
         styles={
             "container": {"padding": "10px 8px", "background-color": "#1A1D24",
                           "border-radius": "14px", "border": "1px solid rgba(194,60,42,0.35)"},
@@ -688,13 +963,28 @@ with st.sidebar:
                                   "font-weight": "800", "border-left": "4px solid #C23C2A"},
         },
     )
+
+    st.markdown("**🗓️ 联赛筛选（全局）**")
+    if "league_filter" not in st.session_state:
+        st.session_state["league_filter"] = []
+    league_options = all_leagues()
+    sel = st.multiselect("限定联赛（不选=全部）", league_options,
+                         default=st.session_state.get("league_filter", []),
+                         placeholder="不选 = 显示全部 T1 联赛")
+    st.session_state["league_filter"] = sel
+    if st.button("清除筛选", use_container_width=True):
+        st.session_state["league_filter"] = []
+        st.rerun()
+    if sel:
+        st.caption(f"已选 {len(sel)} 个联赛")
     st.caption(f"数据快照 · {datetime.now(CST).strftime('%Y-%m-%d')}")
 
 PAGES = {"T1 比赛库": page_matches, "深度复盘": page_match_detail,
-         "英雄风向": page_heroes, "战队与联赛": page_teams, "关于": page_about}
+         "英雄风向": page_heroes, "战队与联赛": page_teams,
+         "对战预测": page_predict, "关于": page_about}
 
 st.markdown('<div class="hero-title" style="font-size:2.1rem">⚔️ Dota2 T1 比赛数据分析</div>'
-            '<div class="hero-sub">仅收录 OpenDota premium 顶级联赛 · BP / 选手 / 经济曲线 / 战队生态全解析</div>',
+            '<div class="hero-sub">主流顶级赛事 · BP / 选手 / 经济曲线 / 战队生态 / Elo 对战预测全解析</div>',
             unsafe_allow_html=True)
 
 PAGES[page]()
