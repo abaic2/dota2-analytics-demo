@@ -122,6 +122,20 @@ def main():
             print(f"  [{i + 1}/{DETAIL_COUNT}] skip {m['match_id']}: {e}", flush=True)
         time.sleep(1.15)
     save("t1Details.json", details)
+
+    # XG 独家分析数据
+    XG_TEAM = "Xtreme Gaming"
+    xg_matches = [m for m in t1 if m.get("radiant_name") == XG_TEAM or m.get("dire_name") == XG_TEAM]
+    print(f"fetching slim details for {len(xg_matches)} XG matches ...", flush=True)
+    xg_details = []
+    for i, m in enumerate(xg_matches):
+        try:
+            xg_details.append(slim_match(fetch(f"/matches/{m['match_id']}", timeout=90)))
+            print(f"  [{i + 1}/{len(xg_matches)}] ok", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{i + 1}/{len(xg_matches)}] skip: {e}", flush=True)
+        time.sleep(1.15)
+    save("xgDetails.json", xg_details)
     print("ALL DONE", flush=True)
 
 

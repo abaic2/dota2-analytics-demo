@@ -785,7 +785,264 @@ def page_teams():
 
 
 # ----------------------------------------------------------------------------
-# 页面 5：对战预测
+# 页面 5：XG 独家分析
+# ----------------------------------------------------------------------------
+XG_TEAM = "Xtreme Gaming"
+
+
+def page_xg():
+    st.markdown('<div class="hero-title">XG 独家分析</div>'
+                '<div class="hero-sub">Xtreme Gaming 深度档案：战绩走势 · 对手克制 · 选手面板 · 英雄池与 BP 行为（跟随联赛筛选）</div>',
+                unsafe_allow_html=True)
+
+    df, fresh = get_filtered_df()
+    if df is None:
+        st.error("数据不可用。")
+        return
+    xg = df[(df["天辉"] == XG_TEAM) | (df["夜魇"] == XG_TEAM)].copy()
+    if not len(xg):
+        st.warning("当前联赛筛选下没有 XG 的比赛，请清空或调整左侧联赛筛选。")
+        return
+    details = [d for d in (load_snapshot("xgDetails.json") or [])
+               if not (st.session_state.get("league_filter") or [])
+               or d.get("league_name") in st.session_state["league_filter"]]
+    maps = hero_maps()
+
+    wins = int((xg["获胜方"] == XG_TEAM).sum())
+    # Elo 评分与排名
+    raw, _ = _t1_base()
+    ratings, acc, _, _ = elo_model(tuple(sorted(raw, key=lambda m: m["start_time"]))) if raw else ({}, 0, 0, 0)
+    xg_elo = ratings.get(XG_TEAM, 1500.0)
+    rank = sorted(ratings.values(), reverse=True).index(xg_elo) + 1 if xg_elo in ratings.values() else None
+
+    w10, n10 = 0, 0
+    sub10 = xg.head(10)
+    if len(sub10):
+        w10, n10 = int((sub10["获胜方"] == XG_TEAM).sum()), len(sub10)
+
+    kpi_row([("T1 场次", f"{len(xg)}"),
+             ("总胜率", f"{wins/len(xg)*100:.1f}%"),
+             ("Elo 评分", f"{xg_elo:.0f}" + (f"（全联盟第 {rank}）" if rank else "")),
+             ("近10场", f"{w10}胜{n10-w10}负"),
+             ("场均时长", fmt_dur(xg["duration"].mean()))])
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 胜负走势", "🎯 对手克制", "👤 选手面板", "🧩 英雄池与 BP", "📋 比赛列表"])
+
+    # ---- Tab1 走势 ----
+    with tab1:
+        xg_t = xg.iloc[::-1].reset_index(drop=True)  # 时间正序
+        xg_t["累计胜场"] = (xg_t["获胜方"] == XG_TEAM).cumsum()
+        xg_t["场次序"] = range(1, len(xg_t) + 1)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=xg_t["场次序"], y=xg_t["累计胜场"], mode="lines+markers",
+                                 name="累计胜场", line=dict(color=GOLD, width=3),
+                                 customdata=xg_t[["开始时间", "天辉", "夜魇", "比分"]],
+                                 hovertemplate="%{customdata[0]}<br>%{customdata[1]} vs %{customdata[2]} (%{customdata[3]})<extra></extra>"))
+        fig.add_trace(go.Scatter(x=xg_t["场次序"], y=xg_t["场次序"] - xg_t["累计胜场"],
+                                 mode="lines", name="累计负场", line=dict(color=DIRE, width=2, dash="dot")))
+        fig.update_layout(title="XG 累计胜负走势（时间正序）", xaxis_title="第 N 场", yaxis_title="场次")
+        st.plotly_chart(plotly_layout(fig, height=400), width="stretch")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            rad = xg[xg["天辉"] == XG_TEAM]
+            dire = xg[xg["夜魇"] == XG_TEAM]
+            fig = go.Figure(go.Bar(x=["天辉", "夜魇"],
+                                   y=[(rad["获胜方"] == XG_TEAM).mean() * 100 if len(rad) else 0,
+                                     (dire["获胜方"] == XG_TEAM).mean() * 100 if len(dire) else 0],
+                                   marker_color=[RADIANT, DIRE],
+                                   text=[f"{(rad['获胜方']==XG_TEAM).mean()*100:.0f}% ({len(rad)}场)" if len(rad) else "无",
+                                         f"{(dire['获胜方']==XG_TEAM).mean()*100:.0f}% ({len(dire)}场)" if len(dire) else "无"],
+                                   textposition="auto"))
+            fig.update_layout(title="分阵营胜率", yaxis_title="胜率%")
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(plotly_layout(fig, height=340), width="stretch")
+        with c2:
+            lg = xg.groupby("联赛").agg(场次=("match_id", "count"),
+                                        胜场=("获胜方", lambda s: (s == XG_TEAM).sum())).reset_index()
+            lg["胜率%"] = (lg["胜场"] / lg["场次"] * 100).round(1)
+            fig = go.Figure(go.Bar(y=lg["联赛"][::-1], x=lg["胜率%"][::-1], orientation="h",
+                                   marker_color=GOLD, text=[f"{v}% ({c}场)" for v, c in zip(lg["胜率%"][::-1], lg["场次"][::-1])],
+                                   textposition="auto"))
+            fig.update_layout(title="分联赛胜率")
+            fig.update_xaxes(range=[0, 110])
+            st.plotly_chart(plotly_layout(fig, height=340), width="stretch")
+
+    # ---- Tab2 对手 ----
+    with tab2:
+        opp_rows = []
+        for _, r in xg.iterrows():
+            opp = r["夜魇"] if r["天辉"] == XG_TEAM else r["天辉"]
+            opp_rows.append({"对手": opp, "胜": 1 if r["获胜方"] == XG_TEAM else 0, "联赛": r["联赛"],
+                             "比分差": (r["radiant_score"] - r["dire_score"]) if r["天辉"] == XG_TEAM
+                                      else (r["dire_score"] - r["radiant_score"])})
+        odf = pd.DataFrame(opp_rows)
+        agg = odf.groupby("对手").agg(交手=("胜", "count"), 胜场=("胜", "sum")).reset_index()
+        agg["胜率%"] = (agg["胜场"] / agg["交手"] * 100).round(1)
+        agg = agg.sort_values("交手", ascending=False)
+        agg_top = agg.head(12)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=agg_top["对手"][::-1], x=(agg_top["交手"] - agg_top["胜场"])[::-1],
+                             orientation="h", name="负", marker_color=DIRE))
+        fig.add_trace(go.Bar(y=agg_top["对手"][::-1], x=agg_top["胜场"][::-1],
+                             orientation="h", name="胜", marker_color=RADIANT))
+        fig.update_layout(barmode="stack", title="对阵各战队胜负（TOP12 交手数）", height=480)
+        st.plotly_chart(plotly_layout(fig, height=480), width="stretch")
+
+        best = agg[agg["交手"] >= 2].nlargest(5, "胜率%")
+        worst = agg[agg["交手"] >= 2].nsmallest(5, "胜率%")
+        c1, c2 = st.columns(2)
+        with c1:
+            trs = "".join(f'<tr><td>{r["对手"]}</td><td>{r["交手"]}</td>'
+                          f'<td style="color:{RADIANT};font-weight:700">{r["胜率%"]}%</td></tr>'
+                          for _, r in best.iterrows())
+            st.markdown(f'<div class="panel"><b>😊 最顺手对手</b><table class="data-table">'
+                        f'<tr><th>对手</th><th>交手</th><th>XG 胜率</th></tr>{trs}</table></div>',
+                        unsafe_allow_html=True)
+        with c2:
+            trs = "".join(f'<tr><td>{r["对手"]}</td><td>{r["交手"]}</td>'
+                          f'<td style="color:{DIRE};font-weight:700">{r["胜率%"]}%</td></tr>'
+                          for _, r in worst.iterrows())
+            st.markdown(f'<div class="panel"><b>😤 最难缠对手</b><table class="data-table">'
+                        f'<tr><th>对手</th><th>交手</th><th>XG 胜率</th></tr>{trs}</table></div>',
+                        unsafe_allow_html=True)
+
+    # ---- Tab3 选手面板 ----
+    with tab3:
+        if not details:
+            st.caption("当前筛选下没有 XG 的解析详情数据。")
+            return
+        prows = []
+        heropool = {}
+        for m in details:
+            rt = (m.get("radiant_team") or {}).get("name") if isinstance(m.get("radiant_team"), dict) else m.get("radiant_team")
+            won = m.get("radiant_win")
+            for p in m.get("players") or []:
+                is_rad = p.get("player_slot", 0) < 100
+                if is_rad != (rt == XG_TEAM):
+                    continue
+                hid = p.get("hero_id")
+                cn, icon = hero_cn(hid, maps)
+                hp = heropool.setdefault(p.get("name"), {})
+                hp.setdefault(hid, {"英雄": cn, "图标": icon, "场次": 0, "胜": 0})
+                hp[hid]["场次"] += 1
+                hp[hid]["胜"] += 1 if ((is_rad and won) or (not is_rad and not won)) else 0
+                k, d, a = p.get("kills", 0) or 0, p.get("deaths", 0) or 0, p.get("assists", 0) or 0
+                prows.append({
+                    "选手": p.get("name") or "匿名",
+                    "英雄": cn, "图标": icon,
+                    "胜": 1 if ((is_rad and won) or (not is_rad and not won)) else 0,
+                    "K": k, "D": d, "A": a,
+                    "GPM": p.get("gold_per_min", 0) or 0, "XPM": p.get("xp_per_min", 0) or 0,
+                    "正补": p.get("last_hits", 0) or 0, "英雄伤害": p.get("hero_damage", 0) or 0,
+                })
+        pdf = pd.DataFrame(prows)
+        summary = pdf.groupby("选手").agg(场次=("胜", "count"), 胜场=("胜", "sum"),
+                                          均K=("K", "mean"), 均D=("D", "mean"), 均A=("A", "mean"),
+                                          均GPM=("GPM", "mean"), 均XPM=("XPM", "mean"),
+                                          均正补=("正补", "mean"), 均英雄伤害=("英雄伤害", "mean")).reset_index()
+        summary["胜率%"] = (summary["胜场"] / summary["场次"] * 100).round(1)
+        summary["场均KDA"] = ((summary["均K"] + summary["均A"]) / summary["均D"].clip(lower=1)).round(2)
+        trs = "".join(
+            f'<tr><td>{r["选手"]}</td><td>{r["场次"]}</td><td style="color:{GOLD};font-weight:700">{r["胜率%"]}%</td>'
+            f'<td>{r["场均KDA"]}</td><td>{r["均K"]:.1f}/{r["均D"]:.1f}/{r["均A"]:.1f}</td>'
+            f'<td>{r["均GPM"]:.0f}</td><td>{r["均XPM"]:.0f}</td><td>{r["均正补"]:.0f}</td><td>{r["均英雄伤害"]:,.0f}</td></tr>'
+            for _, r in summary.iterrows())
+        st.markdown(f'<div class="panel"><b>五人组数据面板</b>（{len(details)} 场解析详情）'
+                    f'<table class="data-table"><tr><th>选手</th><th>场次</th><th>胜率</th><th>KDA</th>'
+                    f'<th>场均 K/D/A</th><th>场均GPM</th><th>场均XPM</th><th>场均正补</th><th>场均英雄伤害</th></tr>'
+                    f'{trs}</table></div>', unsafe_allow_html=True)
+
+        st.markdown("**个人英雄池**（按使用场次排序，最多展示 6 个）")
+        cols = st.columns(len(summary))
+        for col, (_, r) in zip(cols, summary.iterrows()):
+            hp = sorted(heropool.get(r["选手"], {}).items(), key=lambda kv: -kv[1]["场次"])[:6]
+            items = "".join(
+                f'<div style="display:flex;justify-content:space-between;margin:2px 0">'
+                f'<span><img src="{v["图标"]}" style="height:24px;border-radius:4px;vertical-align:middle;margin-right:4px">{v["英雄"]}</span>'
+                f'<span style="color:{GOLD}">{v["场次"]}场</span></div>'
+                for _, v in hp)
+            col.markdown(f'<div class="panel"><b style="color:{ACCENT}">{r["选手"]}</b>{items}</div>',
+                         unsafe_allow_html=True)
+
+    # ---- Tab4 英雄池与 BP ----
+    with tab4:
+        if not details:
+            st.caption("当前筛选下没有 XG 的解析详情数据。")
+            return
+        from collections import Counter as _C
+        hero_stat = {}
+        ban_against = _C()
+        fp_cnt, lp_cnt = _C(), _C()
+        for m in details:
+            pb = m.get("picks_bans") or []
+            rt = (m.get("radiant_team") or {}).get("name") if isinstance(m.get("radiant_team"), dict) else m.get("radiant_team")
+            xg_is_rad = rt == XG_TEAM
+            if pb:
+                picks = sorted([x for x in pb if x["is_pick"]], key=lambda x: x["order"])
+                bans = [x for x in pb if not x["is_pick"]]
+                xg_bans = [x for x in bans if x["team"] == (0 if xg_is_rad else 1)]
+                opp_bans = [x for x in bans if x["team"] != (0 if xg_is_rad else 1)]
+                if picks:
+                    if picks[0]["team"] == (0 if xg_is_rad else 1):
+                        fp_cnt[picks[0]["hero_id"]] += 1
+                    if picks[-1]["team"] == (0 if xg_is_rad else 1):
+                        lp_cnt[picks[-1]["hero_id"]] += 1
+                for x in opp_bans:
+                    ban_against[x["hero_id"]] += 1
+            for p in m.get("players") or []:
+                is_rad = p.get("player_slot", 0) < 100
+                if is_rad != xg_is_rad:
+                    continue
+                hid = p.get("hero_id")
+                s = hero_stat.setdefault(hid, {"场次": 0, "胜": 0})
+                s["场次"] += 1
+                s["胜"] += 1 if ((is_rad and m.get("radiant_win")) or (not is_rad and not m.get("radiant_win"))) else 0
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**🧩 XG 英雄池**（按出场排序）")
+            rows = sorted(hero_stat.items(), key=lambda kv: -kv[1]["场次"])[:12]
+            trs = ""
+            for hid, s in rows:
+                cn, icon = hero_cn(hid, maps)
+                trs += (f'<tr><td><img src="{icon}" style="height:30px;border-radius:5px;vertical-align:middle;margin-right:6px">{cn}</td>'
+                        f'<td>{s["场次"]}</td><td style="color:{GOLD};font-weight:700">{s["胜"]/s["场次"]*100:.0f}%</td></tr>')
+            st.markdown(f'<table class="data-table"><tr><th>英雄</th><th>出场</th><th>胜率</th></tr>{trs}</table>',
+                        unsafe_allow_html=True)
+        with c2:
+            st.markdown("**🚫 对手针对 XG 的禁用 TOP 8**")
+            trs = ""
+            for i, (hid, cnt) in enumerate(ban_against.most_common(8), 1):
+                cn, icon = hero_cn(hid, maps)
+                trs += (f'<tr><td>{i}</td>'
+                        f'<td><img src="{icon}" style="height:30px;border-radius:5px;vertical-align:middle;margin-right:6px">{cn}</td>'
+                        f'<td>{cnt}</td></tr>')
+            st.markdown(f'<table class="data-table"><tr><th>#</th><th>英雄</th><th>被禁次数</th></tr>{trs}</table>',
+                        unsafe_allow_html=True)
+
+        st.markdown("**🎯 XG 的 BP 顺位行为**")
+        c3, c4 = st.columns(2)
+        with c3:
+            trs = "".join(f'<tr><td>{i}</td><td>{hero_cn(h, maps)[0]}</td><td>{v}</td></tr>'
+                          for i, (h, v) in enumerate(sorted(fp_cnt.items(), key=lambda kv: -kv[1])[:5], 1))
+            st.markdown(f'<div class="panel"><b>XG 一选的英雄</b><table class="data-table">'
+                        f'<tr><th>#</th><th>英雄</th><th>次数</th></tr>{trs}</table></div>', unsafe_allow_html=True)
+        with c4:
+            trs = "".join(f'<tr><td>{i}</td><td>{hero_cn(h, maps)[0]}</td><td>{v}</td></tr>'
+                          for i, (h, v) in enumerate(sorted(lp_cnt.items(), key=lambda kv: -kv[1])[:5], 1))
+            st.markdown(f'<div class="panel"><b>XG 留到末选的英雄</b><table class="data-table">'
+                        f'<tr><th>#</th><th>英雄</th><th>次数</th></tr>{trs}</table></div>', unsafe_allow_html=True)
+        st.caption("对手针对禁用 = XG 参赛场次中，对方队伍禁用的英雄排行，反映 XG 的版本威慑力。")
+
+    # ---- Tab5 比赛列表 ----
+    with tab5:
+        st.dataframe(xg[["开始时间", "联赛", "系列赛", "天辉", "夜魇", "获胜方", "比分", "时长"]],
+                     width="stretch", hide_index=True, height=480)
+
+
+# ----------------------------------------------------------------------------
+# 页面 6：对战预测
 # ----------------------------------------------------------------------------
 def page_predict():
     st.markdown('<div class="hero-title">对战预测</div>'
@@ -949,8 +1206,8 @@ with st.sidebar:
     st.caption("OpenDota 真实数据 · Streamlit Demo")
     page = option_menu(
         menu_title=None,
-        options=["T1 比赛库", "深度复盘", "英雄风向", "战队与联赛", "对战预测", "关于"],
-        icons=["list-stars", "magnifying-glass-chart", "fire", "trophy", "cpu", "info-circle"],
+        options=["T1 比赛库", "深度复盘", "英雄风向", "战队与联赛", "XG 独家分析", "对战预测", "关于"],
+        icons=["list-stars", "magnifying-glass-chart", "fire", "trophy", "star", "cpu", "info-circle"],
         styles={
             "container": {"padding": "10px 8px", "background-color": "#1A1D24",
                           "border-radius": "14px", "border": "1px solid rgba(194,60,42,0.35)"},
@@ -981,7 +1238,7 @@ with st.sidebar:
 
 PAGES = {"T1 比赛库": page_matches, "深度复盘": page_match_detail,
          "英雄风向": page_heroes, "战队与联赛": page_teams,
-         "对战预测": page_predict, "关于": page_about}
+         "XG 独家分析": page_xg, "对战预测": page_predict, "关于": page_about}
 
 st.markdown('<div class="hero-title" style="font-size:2.1rem">⚔️ Dota2 T1 比赛数据分析</div>'
             '<div class="hero-sub">主流顶级赛事 · BP / 选手 / 经济曲线 / 战队生态 / Elo 对战预测全解析</div>',
